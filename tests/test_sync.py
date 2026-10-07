@@ -11,7 +11,8 @@ from contextlib import contextmanager
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app" / "main"))
@@ -25,7 +26,7 @@ from water_sync.config import Settings, load_settings
 from water_sync.errors import ApiError, SecretFilter, SyncError
 from water_sync.exporter import report_rows, write_report
 from water_sync.importer import import_cards
-from water_sync.sftp import download, upload
+from water_sync.sftp import connection as sftp_connection, download, upload
 from water_sync.storage import Journal, import_lock, save_json
 
 
@@ -407,6 +408,47 @@ class ApiTests(IsolatedCase):
 
 
 class TransferTests(IsolatedCase):
+    def ssh_stubs(self):
+        client = MagicMock()
+        library = SimpleNamespace(SSHClient=MagicMock(return_value=client),
+                                  SSHException=type("FakeSshError", (Exception,), {}),
+                                  AutoAddPolicy=MagicMock(return_value="auto-accept"),
+                                  RejectPolicy=MagicMock(return_value="verify-key"))
+        return client, library
+
+    def test_missing_known_hosts_allows_connection_without_creating_key_file(self):
+        client, library = self.ssh_stubs()
+        with patch.dict(sys.modules, {"paramiko": library}):
+            with sftp_connection(self.config):
+                client.connect.assert_called_once()
+        client.load_host_keys.assert_not_called()
+        client.set_missing_host_key_policy.assert_called_once_with("auto-accept")
+        client.close.assert_called_once()
+        self.assertFalse(self.config.known_hosts_file.exists())
+
+    def test_existing_known_hosts_enables_key_verification(self):
+        self.config.known_hosts_file.write_text("test host key", encoding="utf-8")
+        client, library = self.ssh_stubs()
+        with patch.dict(sys.modules, {"paramiko": library}):
+            with sftp_connection(self.config):
+                client.connect.assert_called_once()
+        client.load_host_keys.assert_called_once_with(str(self.config.known_hosts_file))
+        client.set_missing_host_key_policy.assert_called_once_with("verify-key")
+        library.AutoAddPolicy.assert_not_called()
+        client.close.assert_called_once()
+
+    def test_invalid_known_hosts_does_not_fall_back_to_automatic_acceptance(self):
+        self.config.known_hosts_file.write_text("invalid key file", encoding="utf-8")
+        client, library = self.ssh_stubs()
+        client.load_host_keys.side_effect = OSError("key file cannot be read")
+        with patch.dict(sys.modules, {"paramiko": library}):
+            with self.assertRaisesRegex(SyncError, "key file cannot be read"):
+                with sftp_connection(self.config):
+                    self.fail("Подключение с некорректным файлом ключей выполнено")
+        client.connect.assert_not_called()
+        library.AutoAddPolicy.assert_not_called()
+        client.close.assert_called_once()
+
     @contextmanager
     def connection(self, fake):
         yield fake

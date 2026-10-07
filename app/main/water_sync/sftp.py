@@ -1,4 +1,4 @@
-"""Обмен файлами: таймауты, проверка ключа сервера и временные файлы."""
+"""Обмен файлами: таймауты, необязательная проверка ключа и временные файлы."""
 
 import posixpath
 from contextlib import contextmanager
@@ -14,12 +14,17 @@ def connection(settings):
 
     if not settings.sftp_username or not settings.sftp_password:
         raise SyncError("Заполните sftp_username и sftp_password в локальных настройках.")
-    if not settings.known_hosts_file.is_file():
-        raise SyncError(f"Не найден файл ключей SFTP {settings.known_hosts_file}. Сверьте отпечаток сервера с администратором и добавьте проверенный ключ; порядок описан в README.")
     client = paramiko.SSHClient()
     try:
-        client.load_host_keys(str(settings.known_hosts_file))
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        if settings.known_hosts_file.exists():
+            # Подготовленный файл включает проверку ключа. Ошибки чтения,
+            # неизвестный сервер и несовпадение ключа останавливают подключение.
+            client.load_host_keys(str(settings.known_hosts_file))
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
+        else:
+            # Совместимость со старой версией: без файла принимаем ключ сервера
+            # автоматически. Его подлинность в этом режиме не проверяется.
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(hostname=settings.sftp_host, port=settings.sftp_port,
                        username=settings.sftp_username, password=settings.sftp_password,
                        timeout=settings.timeout_seconds, banner_timeout=settings.timeout_seconds,
