@@ -94,7 +94,7 @@ class MainWindow(QtWidgets.QWidget):
 
     def display_result(self, result):
         if "completed" in result:
-            text = f"Импорт завершён: начислено {result['completed']}, уже подтверждено {result['skipped']}, всего {result['total']}."
+            text = f"Импорт завершён: начислено {result['completed']}, уже подтверждено {result['skipped']}, пропущено из-за ошибок {result['rejected']}, всего {result['total']}."
         else:
             text = f"Выгрузка завершена: строк {result['exported']}."
         self.status.setText(text)

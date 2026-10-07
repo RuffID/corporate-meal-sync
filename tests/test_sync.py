@@ -21,7 +21,7 @@ import requests
 
 from water_sync.api import IikoClient
 from water_sync.cards import GuestCache, parse_card, read_cards
-from water_sync.cli import parse_day, parser, resolve_refill
+from water_sync.cli import parse_day, parser, resolve_refill, run_job
 from water_sync.config import Settings, load_settings
 from water_sync.errors import ApiError, SecretFilter, SyncError
 from water_sync.exporter import report_rows, write_report
@@ -161,8 +161,11 @@ class ImportTests(IsolatedCase):
         for field in ("isDeleted", "isBlocked"):
             with self.subTest(field=field):
                 self.client.guests[GUEST_ID][field] = True
-                with self.assertRaisesRegex(SyncError, field):
-                    import_cards(self.config, self.client, self.path, DAY)
+                with self.assertLogs("water_sync", level="WARNING") as captured:
+                    result = import_cards(self.config, self.client, self.path, DAY)
+                self.assertEqual(result["rejected"], 1)
+                self.assertEqual(result["completed"], 0)
+                self.assertIn(field, "\n".join(captured.output))
                 self.client.guests[GUEST_ID][field] = False
         self.assertEqual(self.client.mutations, [])
 
@@ -174,27 +177,37 @@ class ImportTests(IsolatedCase):
 
     def test_inactive_card_is_not_refilled(self):
         self.client.guests[GUEST_ID]["cards"][0]["IsActivated"] = False
-        with self.assertRaisesRegex(SyncError, "активных карт"):
-            import_cards(self.config, self.client, self.path, DAY)
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result["rejected"], 1)
+        self.assertIn("активных карт", "\n".join(captured.output))
         self.assertEqual(self.client.mutations, [])
 
     def test_guest_changed_after_preflight_is_checked_again_before_mutation(self):
+        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n", encoding="utf-8")
+        self.client.guests[OTHER_ID] = guest(self.config, SECOND_NAME, OTHER_ID)
         original = self.client.by_id
         def changed(guest_id):
             result = original(guest_id)
-            result["isDeleted"] = True
+            if guest_id == GUEST_ID:
+                result["isDeleted"] = True
             return result
         self.client.by_id = changed
-        with self.assertRaisesRegex(SyncError, "isDeleted=true"):
-            import_cards(self.config, self.client, self.path, DAY)
-        self.assertEqual(self.client.mutations, [])
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result["rejected"], 1)
+        self.assertEqual(result["completed"], 1)
+        self.assertIn("isDeleted=true", "\n".join(captured.output))
+        self.assertEqual(self.client.mutations, [("refill", OTHER_ID)])
 
     def test_returned_deleted_guest_after_create_is_not_given_category(self):
-        self.client.guests = {}
+        self.path.write_text(SECOND_NAME + "\n" + NAME + "\n", encoding="utf-8")
         self.client.created_deleted = True
-        with self.assertRaisesRegex(SyncError, "isDeleted=true"):
-            import_cards(self.config, self.client, self.path, DAY)
-        self.assertEqual(self.client.mutations, [("create", NAME)])
+        with self.assertLogs("water_sync", level="WARNING"):
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result["rejected"], 1)
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(self.client.mutations, [("create", SECOND_NAME), ("refill", GUEST_ID)])
 
     def test_foreign_refill_requires_manual_reconciliation(self):
         self.client.events[GUEST_ID] = [{"transactionType": "RefillWallet", "transactionSum": 100, "comment": None}]
@@ -205,6 +218,8 @@ class ImportTests(IsolatedCase):
         self.assertEqual(import_cards(self.config, self.client, self.path, DAY)["skipped"], 1)
 
     def test_timeout_is_persisted_and_empty_report_does_not_allow_replay(self):
+        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n", encoding="utf-8")
+        self.client.guests[OTHER_ID] = guest(self.config, SECOND_NAME, OTHER_ID)
         self.client.refill_error = requests.Timeout("Обрыв ответа")
         with self.assertRaises(requests.Timeout):
             import_cards(self.config, self.client, self.path, DAY)
@@ -230,13 +245,50 @@ class ImportTests(IsolatedCase):
             import_cards(self.config, self.client, self.path, DAY)
         self.assertEqual(self.client.mutations, [])
 
-    def test_last_guest_failure_is_found_before_first_refill(self):
-        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n", encoding="utf-8")
+    def test_inactive_category_does_not_stop_cards_before_or_after_it(self):
+        third_name = "CC00000000002C01"
+        third_id = "77777777-7777-4777-8777-777777777777"
+        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n" + third_name + "\n", encoding="utf-8")
         second = guest(self.config, SECOND_NAME, OTHER_ID)
         second["categories"][0]["isActive"] = False
         self.client.guests[OTHER_ID] = second
-        with self.assertRaisesRegex(SyncError, "не действует"):
+        self.client.guests[third_id] = guest(self.config, third_name, third_id)
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 2, "skipped": 0, "rejected": 1, "total": 3})
+        log = "\n".join(captured.output)
+        for value in (SECOND_NAME, OTHER_ID, "строка 2", "не действует"):
+            self.assertIn(value, log)
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID), ("refill", third_id)])
+
+    def test_deleted_guest_does_not_stop_next_valid_card(self):
+        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n", encoding="utf-8")
+        self.client.guests[GUEST_ID]["isDeleted"] = True
+        self.client.guests[OTHER_ID] = guest(self.config, SECOND_NAME, OTHER_ID)
+        with self.assertLogs("water_sync", level="WARNING"):
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 1, "skipped": 0, "rejected": 1, "total": 2})
+        self.assertEqual(self.client.mutations, [("refill", OTHER_ID)])
+
+    def test_api_failure_still_stops_before_any_refills(self):
+        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n", encoding="utf-8")
+        original = self.client.by_card
+        def lookup(track):
+            if track == parse_card(SECOND_NAME, "test").track:
+                raise ApiError(401, "Unauthorized", "Нет доступа к API", "")
+            return original(track)
+        self.client.by_card = lookup
+        with self.assertRaises(ApiError):
             import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(self.client.mutations, [])
+
+    def test_invalid_guest_does_not_hide_an_unknown_financial_operation(self):
+        journal = Journal(self.config, DAY)
+        journal.record(parse_card(NAME, "test"), GUEST_ID, "unknown", "Сбой ответа")
+        self.client.guests[GUEST_ID]["isDeleted"] = True
+        with self.assertRaisesRegex(SyncError, "результат прежнего запроса неизвестен"):
+            import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(journal.get("0000000042")["state"], "unknown")
         self.assertEqual(self.client.mutations, [])
 
     def test_deleted_cached_duplicate_is_replaced_by_live_card_owner(self):
@@ -252,8 +304,10 @@ class ImportTests(IsolatedCase):
         cache = GuestCache(self.folder / "guests.verified.json")
         cache.remember(parse_card(NAME, "test"), OTHER_ID)
         self.client.guests[OTHER_ID] = guest(self.config, NAME, OTHER_ID)
-        with self.assertRaisesRegex(SyncError, "ручная сверка"):
-            import_cards(self.config, self.client, self.path, DAY)
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result["rejected"], 1)
+        self.assertIn("ручная сверка", "\n".join(captured.output))
         self.assertEqual(self.client.mutations, [])
 
     def test_amount_change_does_not_create_a_second_daily_credit(self):
@@ -296,12 +350,56 @@ class InputTests(IsolatedCase):
                 with self.assertRaisesRegex(SyncError, "ровно 16"):
                     read_cards(self.path)
 
-    def test_duplicates_and_track_collisions_are_rejected_before_api(self):
-        for other in (NAME, "CC00000000002A01"):
-            self.path.write_text(NAME + "\n" + other + "\n", encoding="utf-8")
-            with self.assertRaises(SyncError):
-                import_cards(self.config, self.client, self.path, DAY)
+    def test_duplicate_row_is_logged_without_a_second_refill(self):
+        self.path.write_text(NAME + "\n" + NAME + "\n", encoding="utf-8")
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 1, "skipped": 0, "rejected": 1, "total": 2})
+        self.assertIn("повторяет строку 1", "\n".join(captured.output))
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID)])
+
+    def test_all_colliding_tracks_are_skipped_but_other_cards_are_refilled(self):
+        self.path.write_text(NAME + "\nCC00000000002A01\n" + SECOND_NAME + "\n", encoding="utf-8")
+        self.client.guests[OTHER_ID] = guest(self.config, SECOND_NAME, OTHER_ID)
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 1, "skipped": 0, "rejected": 2, "total": 3})
+        self.assertEqual(len(captured.output), 2)
+        self.assertEqual(self.client.mutations, [("refill", OTHER_ID)])
+
+    def test_invalid_rows_are_logged_and_valid_cards_are_processed(self):
+        self.path.write_text("bad\n" + NAME + "\n" + SECOND_NAME + "AB\n" + SECOND_NAME + "\n", encoding="utf-8")
+        self.client.guests[OTHER_ID] = guest(self.config, SECOND_NAME, OTHER_ID)
+        with self.assertLogs("water_sync", level="WARNING") as captured:
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 2, "skipped": 0, "rejected": 2, "total": 4})
+        log = "\n".join(captured.output)
+        for value in (self.path.name, "строка 1", "строка 3", "ровно 16"):
+            self.assertIn(value, log)
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID), ("refill", OTHER_ID)])
+
+    def test_all_invalid_rows_produce_a_summary_without_mutations(self):
+        self.path.write_text("bad\n" + NAME + "AB\n", encoding="utf-8")
+        with self.assertLogs("water_sync", level="WARNING"):
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 0, "skipped": 0, "rejected": 2, "total": 2})
         self.assertEqual(self.client.mutations, [])
+
+    def test_local_import_scenario_reaches_valid_cards_after_invalid_rows(self):
+        path = self.config.csv_path(DAY, "SKD-IIKO")
+        path.parent.mkdir()
+        path.write_text("bad\n" + NAME + "\n", encoding="utf-8")
+        self.client.authenticate = MagicMock()
+        self.client.close = MagicMock()
+        self.client.token = "test-token"
+        with patch("water_sync.cli.load_settings", return_value=self.config), \
+             patch("water_sync.cli.configure_logging", return_value=SecretFilter()), \
+             patch("water_sync.cli.IikoClient", return_value=self.client), \
+             self.assertLogs("water_sync", level="INFO") as captured:
+            result = run_job("import-local", DAY)
+        self.assertEqual(result, {"completed": 1, "skipped": 0, "rejected": 1, "total": 2})
+        self.assertIn("пропущено из-за ошибок 1", "\n".join(captured.output))
+        self.client.close.assert_called_once()
 
     def test_export_validates_rows_before_replacing_file(self):
         self.path.write_bytes(b"previous export")
@@ -456,13 +554,24 @@ class TransferTests(IsolatedCase):
     def test_failed_or_invalid_download_does_not_replace_previous_csv(self):
         class FakeSftp:
             def get(self, remote, local):
-                Path(local).write_bytes(b"bad identifier")
+                Path(local).write_bytes(b"\xff")
         self.path.write_bytes(b"previous csv")
         with patch("water_sync.sftp.connection", return_value=self.connection(FakeSftp())):
             with self.assertRaises(SyncError):
                 download(self.config, self.path)
         self.assertEqual(self.path.read_bytes(), b"previous csv")
         self.assertEqual(list(self.folder.glob("*.part")), [])
+
+    def test_download_accepts_bad_rows_so_valid_cards_can_be_imported(self):
+        class FakeSftp:
+            def get(self, remote, local):
+                Path(local).write_text("bad\n" + NAME + "\n", encoding="utf-8")
+        with patch("water_sync.sftp.connection", return_value=self.connection(FakeSftp())):
+            download(self.config, self.path)
+        with self.assertLogs("water_sync", level="WARNING"):
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 1, "skipped": 0, "rejected": 1, "total": 2})
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID)])
 
     def test_upload_failure_removes_only_remote_temporary_file(self):
         class FakeSftp:

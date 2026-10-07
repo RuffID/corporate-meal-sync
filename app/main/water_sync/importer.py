@@ -4,7 +4,7 @@ import logging
 from decimal import Decimal, InvalidOperation
 
 from .cards import GuestCache, read_cards
-from .errors import SyncError
+from .errors import CardError, SyncError
 from .storage import Journal
 
 
@@ -19,13 +19,13 @@ def validate_guest(guest, card):
         if type(guest.get(field)) is not bool:
             raise SyncError(f"Гость {guest_id}, карта {card.track}: API не вернул логический {field}; начисление запрещено.")
         if guest[field]:
-            raise SyncError(f"Гость {guest_id}, карта {card.track}: {field}=true; начисление запрещено.")
+            raise CardError(f"Гость {guest_id}, карта {card.track}: {field}=true; начисление запрещено.")
     cards = guest.get("cards")
     if not isinstance(cards, list) or any(not isinstance(item, dict) for item in cards):
         raise SyncError(f"Гость {guest_id}: API не вернул корректный список карт.")
     matches = [item for item in cards if item.get("Track") == card.track and item.get("IsActivated") is True]
     if len(matches) != 1:
-        raise SyncError(f"Гость {guest_id}: активных карт с треком {card.track} найдено {len(matches)}, ожидается одна.")
+        raise CardError(f"Гость {guest_id}: активных карт с треком {card.track} найдено {len(matches)}, ожидается одна.")
     if not isinstance(guest.get("categories"), list) or any(not isinstance(item, dict) for item in guest["categories"]):
         raise SyncError(f"Гость {guest_id}: API не вернул корректный список категорий.")
     balances = guest.get("walletBalances")
@@ -40,9 +40,9 @@ def find_guest(client, cache, card):
         old = client.by_id(cached["guestId"])
         # Удалённый дубль можно заменить только подтверждённым действующим владельцем карты.
         if old.get("isDeleted") is not True:
-            raise SyncError(f"Карта {card.track}: кеш указывает на {cached['guestId']}, поиск вернул {guest['id'] if guest else 'отсутствие карты'}. Нужна ручная сверка.")
+            raise CardError(f"Карта {card.track}: кеш указывает на {cached['guestId']}, поиск вернул {guest['id'] if guest else 'отсутствие карты'}. Нужна ручная сверка.")
         if guest is None:
-            raise SyncError(f"Карта {card.track}: кешированный гость удалён, действующий владелец не найден. Автоматическое восстановление отменено.")
+            raise CardError(f"Карта {card.track}: кешированный гость удалён, действующий владелец не найден. Автоматическое восстановление отменено.")
         LOGGER.warning("Карта %s: вместо удалённого кешированного гостя %s найден %s.", card.track, old["id"], guest["id"])
     if guest is not None:
         validate_guest(guest, card)
@@ -52,10 +52,10 @@ def find_guest(client, cache, card):
 def category_assigned(guest, settings):
     categories = [item for item in guest["categories"] if item.get("id") == settings.category_id]
     if len(categories) > 1:
-        raise SyncError(f"Гость {guest['id']}: API вернул несколько записей категории {settings.category_id}.")
+        raise CardError(f"Гость {guest['id']}: API вернул несколько записей категории {settings.category_id}.")
     if categories:
         if categories[0].get("isActive") is not True:
-            raise SyncError(f"Гость {guest['id']}: категория {settings.category_id} не действует; повторно не назначаем.")
+            raise CardError(f"Гость {guest['id']}: категория {settings.category_id} не действует; повторно не назначаем.")
         return True
     return False
 
@@ -115,50 +115,72 @@ def check_refills(client, journal, card, guest_id):
 
 
 def import_cards(settings, client, path, day):
-    cards = read_cards(path)
+    invalid_rows = []
+    cards = read_cards(path, on_invalid=invalid_rows.append)
+    for error in invalid_rows:
+        LOGGER.warning("Пропущена строка CSV: %s", error)
+    rejected = len(invalid_rows)
+    total = len(cards) + rejected
+    if not cards:
+        return {"completed": 0, "skipped": 0, "rejected": rejected, "total": total}
     # Старые кеши содержат обрезанные имена и неверные треки. Их не мигрируем
     # догадками: новый кеш заполняется только после проверки владельца в API.
     cache = GuestCache(settings.data_dir / "guests.verified.json")
     journal = Journal(settings, day)
     plans, skipped = [], 0
-    # Проверяем все существующие карты до первого POST, чтобы ошибка в конце
-    # файла не приводила к ненужной частичной обработке начала.
+    # Проверяем существующие карты до первого POST. Проблемы отдельных гостей
+    # пропускаем; ошибки API и финансовой сверки останавливают весь сценарий.
     for card in cards:
         entry = journal.get(card.track)
         if entry and entry["state"] == "confirmed":
             skipped += 1
             LOGGER.info("Карта %s: начисление за %s уже подтверждено журналом.", card.track, day)
             continue
-        guest = find_guest(client, cache, card)
-        if guest is None and entry:
-            raise SyncError(f"Карта {card.track}: журнал уже содержит гостя {entry['guest_id']}, но поиск карты его не находит. Нужна сверка.")
-        if guest is not None:
-            category_assigned(guest, settings)
+        try:
+            guest = find_guest(client, cache, card)
+            if guest is None and entry:
+                raise SyncError(f"Карта {card.track}: журнал уже содержит гостя {entry['guest_id']}, но поиск карты его не находит. Нужна сверка.")
+            if guest is not None:
+                category_assigned(guest, settings)
+        except CardError as error:
+            if entry and entry["state"] in ("sending", "unknown"):
+                raise SyncError(f"Карта {card.track}: результат прежнего запроса неизвестен; ошибка гостя не заменяет финансовую сверку. {error}") from None
+            rejected += 1
+            LOGGER.warning("Пропущен пропуск %s (строка %s, карта %s): %s", card.name, card.line, card.track, error)
+            continue
         if guest is not None and check_refills(client, journal, card, guest["id"]):
             skipped += 1
             continue
         plans.append((card, guest))
     completed = 0
     for card, guest in plans:
-        if guest is None:
-            guest_id = client.create_guest(card)
-            # create_or_update способен вернуть существующего гостя. Его статус
-            # и карту проверяем до категории, программы и пополнения.
+        try:
+            if guest is None:
+                guest_id = client.create_guest(card)
+                # create_or_update способен вернуть существующего гостя. Его статус
+                # и карту проверяем до категории, программы и пополнения.
+                guest = client.by_id(guest_id)
+                validate_guest(guest, card)
+                if check_refills(client, journal, card, guest_id):
+                    skipped += 1
+                    continue
+            guest_id = guest["id"]
+            # Подготовка большого файла может занять время. Перед изменениями
+            # перечитываем гостя: его могли удалить или перевыпустить карту.
             guest = client.by_id(guest_id)
             validate_guest(guest, card)
+            cache.remember(card, guest_id)
+            guest = ensure_ready(client, guest, card, settings)
+            # Повторная сверка перед POST обнаруживает изменения с момента подготовки.
             if check_refills(client, journal, card, guest_id):
                 skipped += 1
                 continue
-        guest_id = guest["id"]
-        # Подготовка большого файла может занять время. Перед изменениями
-        # перечитываем гостя: его могли удалить или перевыпустить карту.
-        guest = client.by_id(guest_id)
-        validate_guest(guest, card)
-        cache.remember(card, guest_id)
-        guest = ensure_ready(client, guest, card, settings)
-        # Повторная сверка перед POST обнаруживает изменения с момента подготовки.
-        if check_refills(client, journal, card, guest_id):
-            skipped += 1
+        except CardError as error:
+            entry = journal.get(card.track)
+            if entry and entry["state"] in ("sending", "unknown"):
+                raise SyncError(f"Карта {card.track}: результат прежнего запроса неизвестен; ошибка гостя не заменяет финансовую сверку. {error}") from None
+            rejected += 1
+            LOGGER.warning("Пропущен пропуск %s (строка %s, карта %s): %s", card.name, card.line, card.track, error)
             continue
         journal.record(card, guest_id, "sending", "Запрос пополнения подготовлен; повтор до подтверждения запрещён.")
         try:
@@ -171,4 +193,4 @@ def import_cards(settings, client, path, day):
         journal.record(card, guest_id, "confirmed", "iikoCard подтвердил пополнение HTTP 200.")
         completed += 1
         LOGGER.info("%s %s: пополнено на %s рублей; ID гостя %s.", day, card.name, settings.refill_amount, guest_id)
-    return {"completed": completed, "skipped": skipped, "total": len(cards)}
+    return {"completed": completed, "skipped": skipped, "rejected": rejected, "total": total}

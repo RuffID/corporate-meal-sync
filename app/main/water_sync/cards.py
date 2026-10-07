@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from uuid import UUID
 
-from .errors import SyncError
+from .errors import CardError, SyncError
 from .storage import read_json, save_json
 
 
@@ -17,34 +17,60 @@ class Card:
 
 def parse_card(value, context):
     if not isinstance(value, str):
-        raise SyncError(f"{context}: идентификатор пропуска должен быть строкой.")
+        raise CardError(f"{context}: идентификатор пропуска должен быть строкой.")
     # Убираем пробелы и только хвостовое заполнение NUL. Середину не исправляем.
     name = value.strip().replace(" ", "").rstrip("\x00").upper()
     if not re.fullmatch(r"[0-9A-F]{16}", name):
         received = repr(name[:80])
-        raise SyncError(f"{context}: получено {received}, длина {len(name)}; ожидаются ровно 16 HEX-символов.")
+        raise CardError(f"{context}: получено {received}, длина {len(name)}; ожидаются ровно 16 HEX-символов.")
     return Card(name, str(int(name[8:14], 16)).zfill(10))
 
 
-def read_cards(path):
+def read_cards(path, on_invalid=None):
+    """С обработчиком пропускаем плохие строки; без него проверяем файл строго."""
     try:
         lines = path.read_text(encoding="utf-8-sig").splitlines()
     except (OSError, UnicodeError) as error:
         raise SyncError(f"Не удалось прочитать CSV {path}: {type(error).__name__}; ожидается UTF-8.") from None
     cards, names, tracks = [], {}, {}
+    row_count = 0
     for number, raw in enumerate(lines, 1):
         if not raw.strip(" \t\x00"):
             continue
-        parsed = parse_card(raw, f"{path.name}, строка {number}")
+        row_count += 1
+        try:
+            parsed = parse_card(raw, f"{path.name}, строка {number}")
+        except CardError as error:
+            if on_invalid is None:
+                raise
+            on_invalid(error)
+            continue
         card = Card(parsed.name, parsed.track, number)
         if card.name in names:
-            raise SyncError(f"{path.name}, строка {number}: пропуск {card.name} повторяет строку {names[card.name]}.")
-        if card.track in tracks:
-            previous = tracks[card.track]
-            raise SyncError(f"{path.name}, строки {previous.line} и {number}: разные пропуска {previous.name} и {card.name} дают одну карту {card.track}.")
-        names[card.name], tracks[card.track] = number, card
+            error = CardError(f"{path.name}, строка {number}: пропуск {card.name} повторяет строку {names[card.name]}.")
+            if on_invalid is None:
+                raise error
+            on_invalid(error)
+            continue
+        if card.track in tracks and on_invalid is None:
+            previous = tracks[card.track][0]
+            raise CardError(f"{path.name}, строки {previous.line} и {number}: разные пропуска {previous.name} и {card.name} дают одну карту {card.track}.")
+        names[card.name] = number
+        tracks.setdefault(card.track, []).append(card)
         cards.append(card)
-    if not cards:
+    if on_invalid is not None:
+        # При коллизии исключаем все разные пропуска с этим треком: выбор
+        # первого мог бы привести к начислению другому владельцу карты.
+        valid = []
+        for card in cards:
+            collisions = tracks[card.track]
+            if len(collisions) > 1:
+                conflicting_lines = ", ".join(str(item.line) for item in collisions)
+                on_invalid(CardError(f"{path.name}, строка {card.line}: пропуск {card.name}, карта {card.track}; разные пропуска в строках {conflicting_lines} дают один трек."))
+            else:
+                valid.append(card)
+        cards = valid
+    if not cards and (on_invalid is None or row_count == 0):
         raise SyncError(f"CSV {path} не содержит пропусков; импорт не выполнен.")
     return cards
 

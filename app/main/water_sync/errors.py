@@ -8,6 +8,10 @@ class SyncError(Exception):
     """Ошибка данных, настройки или состояния операции."""
 
 
+class CardError(SyncError):
+    """Проблема отдельного пропуска или гостя; импорт остальных карт продолжается."""
+
+
 class ApiError(SyncError):
     def __init__(self, status, code, message, body):
         self.status = status

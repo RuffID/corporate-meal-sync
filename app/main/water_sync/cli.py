@@ -65,13 +65,14 @@ def run_job(command, day=None, config_path=None, start=None, end=None):
                 if command == "import-sftp":
                     download(settings, path)
                     LOGGER.info("CSV скачан с SFTP: %s.", path.name)
-                # Проверяем файл до авторизации; при ошибке нет запросов к iiko.
+                # Проверяем чтение CSV до авторизации. Плохие строки не мешают
+                # остальным картам; причины их пропуска запишет import_cards.
                 from .cards import read_cards
-                read_cards(path)
+                read_cards(path, on_invalid=lambda error: None)
                 client.authenticate()
                 secrets.add(client.token)
                 result = import_cards(settings, client, path, day)
-                LOGGER.info("Импорт %s завершён: начислено %s, уже подтверждено %s, всего %s.", day, result["completed"], result["skipped"], result["total"])
+                LOGGER.info("Импорт %s завершён: начислено %s, уже подтверждено %s, пропущено из-за ошибок %s, всего %s.", day, result["completed"], result["skipped"], result["rejected"], result["total"])
                 return result
             if command != "export":
                 raise SyncError(f"Неизвестный сценарий {command}.")

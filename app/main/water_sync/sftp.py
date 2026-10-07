@@ -48,7 +48,9 @@ def download(settings, destination):
                 sftp.get(remote, str(temporary))
             except FileNotFoundError:
                 raise SyncError(f"На SFTP отсутствует {remote}. Ранее скачанный CSV не использован. Получите актуальный файл и выполните import-local.") from None
-        read_cards(temporary)
+        # Чтение файла проверяем до замены, а плохие строки будут пропущены
+        # и залогированы импортом. Они не отменяют загрузку остальных карт.
+        read_cards(temporary, on_invalid=lambda error: None)
         # Незаконченная или некорректная загрузка не заменяет исправный CSV.
         temporary.replace(destination)
     finally:
