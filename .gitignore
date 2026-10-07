@@ -1,0 +1,39 @@
+# Локальные данные, архивы и настройки подключения.
+restore/
+Csv/
+Logs/
+State/
+*.csv
+*log*.txt
+*.log
+guests*.json
+guest_card_list.txt
+datareport.txt
+config.local.json
+.env
+.env.*
+!.env.example
+known_hosts
+*.pem
+*.key
+
+# Установщики и резервные копии.
+*.exe
+*.msi
+*.7z
+*.zip
+*.bak
+*.tmp
+*.part
+*.lnk
+desktop.ini
+
+# Среда Python и редакторы.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
+.vs/
