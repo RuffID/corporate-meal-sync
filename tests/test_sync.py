@@ -573,22 +573,31 @@ class TransferTests(IsolatedCase):
         self.assertEqual(result, {"completed": 1, "skipped": 0, "rejected": 1, "total": 2})
         self.assertEqual(self.client.mutations, [("refill", GUEST_ID)])
 
-    def test_upload_failure_removes_only_remote_temporary_file(self):
+    def test_upload_works_without_rename_extension_and_replaces_final_file(self):
+        source = self.folder / "20300115-IIKO-1C.csv"
+        source.write_bytes(b"new export")
+        remote = self.config.sftp_remote_dir + "/" + source.name
         class FakeSftp:
-            removed = []
+            files = {remote: b"previous export"}
             def put(self, source, remote, confirm):
-                self.remote = remote
-            def posix_rename(self, temporary, target):
-                raise OSError("rename not supported")
-            def remove(self, remote):
-                self.removed.append(remote)
+                self.confirm = confirm
+                self.files[remote] = Path(source).read_bytes()
         fake = FakeSftp()
         with patch("water_sync.sftp.connection", return_value=self.connection(fake)):
-            with self.assertRaises(OSError):
+            upload(self.config, source)
+        self.assertEqual(fake.files, {remote: b"new export"})
+        self.assertTrue(fake.confirm)
+        self.assertEqual(source.read_bytes(), b"new export")
+
+    def test_upload_failure_is_reported_without_retry_or_local_file_loss(self):
+        previous = self.path.read_bytes()
+        fake = MagicMock(spec=["put"])
+        fake.put.side_effect = OSError("upload interrupted")
+        with patch("water_sync.sftp.connection", return_value=self.connection(fake)):
+            with self.assertRaisesRegex(OSError, "upload interrupted"):
                 upload(self.config, self.path)
-        self.assertEqual(fake.removed, [fake.remote])
-        self.assertTrue(fake.remote.endswith(".part"))
-        self.assertTrue(self.path.exists())
+        fake.put.assert_called_once_with(str(self.path), self.config.sftp_remote_dir + "/" + self.path.name, confirm=True)
+        self.assertEqual(self.path.read_bytes(), previous)
 
 
 class SourceTests(unittest.TestCase):

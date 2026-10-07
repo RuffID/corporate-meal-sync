@@ -60,16 +60,8 @@ def download(settings, destination):
 
 def upload(settings, source):
     remote = posixpath.join(settings.sftp_remote_dir, source.name)
-    temporary = remote + "." + uuid4().hex + ".part"
     with connection(settings) as sftp:
-        try:
-            sftp.put(str(source), temporary, confirm=True)
-            # OpenSSH умеет атомарно заменить существующий файл. Отказ расширения
-            # не маскируем удалением старого файла или неатомарной перезаписью.
-            sftp.posix_rename(temporary, remote)
-        except Exception:
-            try:
-                sftp.remove(temporary)
-            except OSError:
-                pass  # Удаление временного файла не должно скрывать исходную ошибку.
-            raise
+        # Как в старой версии: пишем сразу в итоговый файл без расширений SFTP.
+        # confirm=True проверяет размер после передачи. При обрыве удалённый
+        # файл может остаться частичным; локальный CSV сохраняется для повторной отправки.
+        sftp.put(str(source), remote, confirm=True)
