@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "app" / "main"))
 
 import requests
 
+from water_sync import storage
 from water_sync.api import IikoClient
 from water_sync.cards import GuestCache, parse_card, read_cards
 from water_sync.cli import parse_day, parser, resolve_refill, run_job
@@ -336,6 +337,124 @@ class ImportTests(IsolatedCase):
             with self.assertRaisesRegex(SyncError, "Другой процесс"):
                 with import_lock(self.folder):
                     self.fail("Вторая блокировка получена")
+
+
+class StorageTests(IsolatedCase):
+    def setUp(self):
+        super().setUp()
+        self.clock = 0.0
+        clock = patch("water_sync.storage.time.monotonic", side_effect=lambda: self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
+        sleep = patch("water_sync.storage.time.sleep", side_effect=self.advance_clock)
+        self.sleep = sleep.start()
+        self.addCleanup(sleep.stop)
+        last_replace = patch("water_sync.storage._last_replace_at", None)
+        last_replace.start()
+        self.addCleanup(last_replace.stop)
+
+    def advance_clock(self, seconds):
+        self.clock += seconds
+
+    def access_denied(self):
+        error = PermissionError("File temporarily unavailable")
+        error.winerror = 5
+        return error
+
+    def test_replacements_are_spaced_even_for_different_files(self):
+        first = self.folder / "first.json"
+        second = self.folder / "second.json"
+        storage.atomic_write(first, b"first")
+        storage.atomic_write(second, b"second")
+        self.advance_clock(0.4)
+        storage.atomic_write(first, b"updated")
+        self.sleep.assert_called_once_with(0.25)
+        self.assertEqual(first.read_bytes(), b"updated")
+        self.assertEqual(second.read_bytes(), b"second")
+
+    def test_temporary_denial_retries_the_same_file_and_content(self):
+        path = self.folder / "journal.json"
+        path.write_bytes(b"old")
+        original_replace = storage.os.replace
+        attempts = []
+        def replace(temporary, target):
+            attempts.append((temporary, target, temporary.read_bytes()))
+            if len(attempts) <= 2:
+                raise self.access_denied()
+            original_replace(temporary, target)
+        with patch("water_sync.storage.os.replace", side_effect=replace):
+            storage.atomic_write(path, b"new")
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue(all(attempt == attempts[0] for attempt in attempts))
+        self.assertEqual(self.clock, 0.5)
+        self.assertEqual(path.read_bytes(), b"new")
+        self.assertEqual(list(self.folder.glob("*.tmp")), [])
+
+    def test_persistent_denial_stops_after_five_seconds_and_preserves_original(self):
+        path = self.folder / "journal.json"
+        path.write_bytes(b"old")
+        error = self.access_denied()
+        attempts = []
+        def replace(temporary, target):
+            attempts.append(self.clock)
+            raise error
+        with patch("water_sync.storage.os.replace", side_effect=replace):
+            with self.assertRaises(PermissionError) as caught:
+                storage.atomic_write(path, b"new")
+        self.assertIs(caught.exception, error)
+        self.assertGreater(len(attempts), 1)
+        self.assertTrue(all(attempt < 5.0 for attempt in attempts))
+        self.assertEqual(self.clock, 5.0)
+        self.assertEqual(path.read_bytes(), b"old")
+        self.assertEqual(list(self.folder.glob("*.tmp")), [])
+
+    def test_other_file_errors_are_not_retried(self):
+        for error in (OSError(28, "No space left"), PermissionError(13, "Permission denied")):
+            with self.subTest(error=error):
+                with patch("water_sync.storage.os.replace", side_effect=error) as replace:
+                    with self.assertRaises(OSError) as caught:
+                        storage.atomic_write(self.folder / "journal.json", b"new")
+                self.assertIs(caught.exception, error)
+                replace.assert_called_once()
+                self.sleep.assert_not_called()
+                self.assertEqual(list(self.folder.glob("*.tmp")), [])
+
+    def test_retry_of_confirmation_does_not_repeat_refill(self):
+        original_replace = storage.os.replace
+        denied = []
+        def replace(temporary, target):
+            data = json.loads(temporary.read_text(encoding="utf-8"))
+            if target.parent.name == "State" and data["entries"]["0000000042"]["state"] == "confirmed" and len(denied) < 2:
+                denied.append(temporary)
+                raise self.access_denied()
+            original_replace(temporary, target)
+        with patch("water_sync.storage.os.replace", side_effect=replace):
+            result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(len(denied), 2)
+        self.assertEqual(result["completed"], 1)
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID)])
+        self.assertEqual(Journal(self.config, DAY).get("0000000042")["state"], "confirmed")
+
+    def test_failed_confirmation_preserves_sending_and_rerun_finishes_remaining_cards(self):
+        self.path.write_text(NAME + "\n" + SECOND_NAME + "\n", encoding="utf-8")
+        self.client.guests[OTHER_ID] = guest(self.config, SECOND_NAME, OTHER_ID)
+        original_replace = storage.os.replace
+        error = self.access_denied()
+        def replace(temporary, target):
+            data = json.loads(temporary.read_text(encoding="utf-8"))
+            if target.parent.name == "State" and data["entries"]["0000000042"]["state"] == "confirmed":
+                raise error
+            original_replace(temporary, target)
+        with patch("water_sync.storage.os.replace", side_effect=replace):
+            with self.assertRaises(PermissionError):
+                import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(Journal(self.config, DAY).get("0000000042")["state"], "sending")
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID)])
+        result = import_cards(self.config, self.client, self.path, DAY)
+        self.assertEqual(result, {"completed": 1, "skipped": 1, "rejected": 0, "total": 2})
+        self.assertEqual(self.client.mutations, [("refill", GUEST_ID), ("refill", OTHER_ID)])
+        self.assertEqual(Journal(self.config, DAY).get("0000000042")["state"], "confirmed")
+        self.assertEqual(Journal(self.config, DAY).get("0000000043")["state"], "confirmed")
 
 
 class InputTests(IsolatedCase):

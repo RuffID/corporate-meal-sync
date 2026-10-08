@@ -3,13 +3,47 @@
 import json
 import os
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 import re
+from threading import Lock
 from uuid import UUID
 
 from .errors import SyncError
+
+
+WRITE_INTERVAL_SECONDS = 0.25
+REPLACE_TIMEOUT_SECONDS = 5.0
+_replace_lock = Lock()
+_last_replace_at = None
+
+
+def _replace_with_retry(temporary, path):
+    """Разносим записи по времени; повторяем только замену занятого файла."""
+    global _last_replace_at
+    with _replace_lock:
+        if _last_replace_at is not None:
+            pause = WRITE_INTERVAL_SECONDS - (time.monotonic() - _last_replace_at)
+            if pause > 0:
+                time.sleep(pause)
+        deadline = time.monotonic() + REPLACE_TIMEOUT_SECONDS
+        while True:
+            try:
+                os.replace(temporary, path)
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 5:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(WRITE_INTERVAL_SECONDS, remaining))
+                if time.monotonic() >= deadline:
+                    raise
+            else:
+                _last_replace_at = time.monotonic()
+                return
 
 
 def read_json(path, default):
@@ -32,7 +66,7 @@ def atomic_write(path, data):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
     finally:
         if temporary is not None and temporary.exists():
             temporary.unlink()
